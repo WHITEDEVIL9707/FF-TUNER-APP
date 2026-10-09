@@ -1,0 +1,344 @@
+name: Build FF Tuner APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Write project files
+        run: |
+          mkdir -p src/main/java/com/fftuner
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "fftuner"
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+          android {
+              namespace = "com.fftuner"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.fftuner"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <queries>
+                  <package android:name="com.dts.freefireth" />
+                  <package android:name="com.dts.freefiremax" />
+                  <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>
+                  <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.HOME" /></intent>
+              </queries>
+              <application android:label="FF Tuner" android:allowBackup="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > src/main/java/com/fftuner/MainActivity.kt <<'EOF'
+          package com.fftuner
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.app.NotificationManager
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.os.StatFs
+          import android.provider.Settings
+          import android.text.format.Formatter
+          import android.util.DisplayMetrics
+          import android.widget.Button
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.roundToInt
+
+          class Style(val v: IntArray, val fire: Int, val fingers: String, val tip: String)
+          class Mode(val boost: Int, val anim: String, val dpi: Double, val fps: String, val gfx: String, val dnd: Boolean, val about: String, val tip: String)
+
+          val STYLES = mapOf(
+              "Rusher" to Style(intArrayOf(92, 88, 82, 76, 55, 70), 70, "3 to 4 fingers, second fire button on the left", "Stay close and flick up to the head while you strafe."),
+              "Assaulter" to Style(intArrayOf(88, 84, 78, 70, 50, 72), 65, "3 fingers, left fire button", "Fight mid-range and pull down slightly to control recoil."),
+              "Flanker" to Style(intArrayOf(90, 86, 80, 72, 52, 78), 68, "4 fingers, fast jump and crouch buttons", "Scan with Free Look before you swing wide."),
+              "Freestyle" to Style(intArrayOf(85, 80, 74, 68, 46, 75), 65, "3 fingers, change layout to match the fight", "Switch scopes quickly and keep your movement unpredictable."),
+              "Support" to Style(intArrayOf(75, 70, 64, 56, 44, 68), 58, "3 fingers", "Hold an angle, keep the crosshair at head height and let enemies walk in."),
+              "Long range" to Style(intArrayOf(78, 74, 68, 60, 42, 65), 60, "3 fingers", "Use the 2x or 4x scope, aim just above the chest and pull down to the head."),
+              "Sniper" to Style(intArrayOf(70, 65, 60, 52, 38, 60), 55, "2 to 3 fingers, scope button under your thumb", "Hold the crosshair on the head line and tap to fire."),
+              "Clutch" to Style(intArrayOf(82, 78, 72, 64, 48, 72), 62, "3 to 4 fingers", "Stay calm, use cover, peek with Free Look and take one fight at a time.")
+          )
+
+          val MODES = mapOf(
+              "Professional" to Mode(3, "0.5", 1.0, "The highest option the game offers", "Smooth for the steadiest frames", true, "Esports style. Fastest response and sharpest screen.", "Plug in the charger, close other apps and set brightness high."),
+              "Tournament" to Mode(2, "0.5", 0.95, "High, locked at 60 for stable frames", "Standard, or Smooth if it stutters", true, "Stable and consistent for scrims and tournaments.", "Use stable Wi-Fi and silence all notifications."),
+              "Ranked" to Mode(1, "0.5", 0.9, "High", "Standard", true, "Balanced power for rank push.", "Restart the phone before a long session."),
+              "Regular" to Mode(0, "0.5", 0.9, "High", "Standard", false, "Everyday casual matches.", "Keep 2 GB of storage free."),
+              "Cool" to Mode(0, "0", 0.8, "Medium or High, capped at 60", "Smooth", true, "Long sessions with less heat.", "Remove the case, do not charge while playing and keep brightness medium."),
+              "Battery Saver" to Mode(0, "0", 0.8, "Medium", "Smooth", false, "Lasts longest on battery.", "Lower the brightness and turn on battery saver."),
+              "Low-End Rescue" to Mode(4, "0", 0.75, "Medium", "Smooth", true, "For weak or old phones. Biggest lag reduction.", "Close all apps, free 3 GB of storage and restart before playing."),
+              "Streaming" to Mode(0, "0.5", 1.0, "60, locked", "Standard", true, "Steady frames while recording or streaming.", "Record at 720p or 1080p and 30 to 60 fps, not higher.")
+          )
+
+          class MainActivity : Activity() {
+              private val BG = Color.parseColor("#0E1424")
+              private val CARD = Color.parseColor("#172038")
+              private val TXT = Color.parseColor("#E8EDF7")
+              private val MUT = Color.parseColor("#97A3BF")
+              private val ACC = Color.parseColor("#FF9A3D")
+              private val OK = Color.parseColor("#4CD08A")
+              private val BAD = Color.parseColor("#FF6B6B")
+              private val labels = listOf("General", "Red Dot", "2x Scope", "4x Scope", "AWM Scope", "Free Look")
+              private val hd = Handler(Looper.getMainLooper())
+              private lateinit var prefs: SharedPreferences
+              private lateinit var rowS: LinearLayout
+              private lateinit var rowM: LinearLayout
+              private lateinit var out: LinearLayout
+              private lateinit var chk: LinearLayout
+              private lateinit var live: TextView
+              private lateinit var nudgeTv: TextView
+              private var style = "Rusher"
+              private var mode = "Professional"
+              private var nudge = 0
+              private var nativeDpi = 400
+              private val tick = object : Runnable {
+                  override fun run() { refresh(); hd.postDelayed(this, 3000) }
+              }
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+              private fun tv(t: String, sp: Float = 15f, c: Int = TXT, b: Boolean = false, mono: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = sp; setTextColor(c); setPadding(0, dp(3), 0, dp(3))
+                  if (b) typeface = Typeface.DEFAULT_BOLD
+                  if (mono) typeface = Typeface.MONOSPACE
+              }
+              private fun btn(t: String, on: Boolean = false, f: () -> Unit) = Button(this).apply {
+                  text = t; setAllCaps(false); setTextColor(if (on) BG else TXT)
+                  setBackgroundColor(if (on) ACC else CARD); setOnClickListener { f() }
+              }
+              private fun chips(row: LinearLayout, names: Collection<String>, cur: String, pick: (String) -> Unit) {
+                  row.removeAllViews()
+                  for (n in names) row.addView(btn(n, n == cur) { pick(n) }, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(6) })
+              }
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+              private fun save() { prefs.edit().putString("style", style).putString("mode", mode).putInt("nudge", nudge).apply() }
+              private fun mb(b: Long) = "${b / 1048576} MB"
+
+              private fun ram() = ActivityManager.MemoryInfo().also { (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it) }
+              private fun disk() = StatFs(Environment.getDataDirectory().path)
+              private fun tier(): String { val g = ram().totalMem / 1e9; return if (g >= 7) "High" else if (g >= 4) "Mid" else "Low" }
+              private fun sticky(): Intent? = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+              private fun temp() = (sticky()?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10f
+              private fun level() = sticky()?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
+              private fun plugged() = (sticky()?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
+              private fun heat(): String {
+                  if (Build.VERSION.SDK_INT < 29) return "n/a"
+                  val s = (getSystemService(POWER_SERVICE) as PowerManager).currentThermalStatus
+                  return listOf("Cool", "Warm", "Hot", "Very hot", "Critical", "Emergency", "Shutdown").getOrElse(s) { "?" }
+              }
+              @Suppress("DEPRECATION")
+              private fun screenInfo(): String {
+                  val m = DisplayMetrics()
+                  windowManager.defaultDisplay.getRealMetrics(m)
+                  val hz = windowManager.defaultDisplay.supportedModes.maxOf { it.refreshRate }
+                  return "${m.widthPixels}x${m.heightPixels}, ${resources.displayMetrics.densityDpi} dpi, up to ${hz.roundToInt()} Hz"
+              }
+              private fun info(): String {
+                  val r = ram()
+                  val d = disk()
+                  val chip = if (Build.VERSION.SDK_INT >= 31) "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}" else Build.HARDWARE
+                  return "Phone: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}\n" +
+                      "Chip: $chip, ${Runtime.getRuntime().availableProcessors()} cores, ${Build.SUPPORTED_ABIS[0]}\n" +
+                      "Memory: ${Formatter.formatShortFileSize(this, r.totalMem)}\n" +
+                      "Storage: ${Formatter.formatShortFileSize(this, d.totalBytes)}, ${Formatter.formatShortFileSize(this, d.availableBytes)} free\n" +
+                      "Screen: ${screenInfo()}\n" +
+                      "Phone tier: ${tier()}"
+              }
+
+              private fun adj() = when (tier()) { "Low" -> 4; "Mid" -> 2; else -> 0 } + MODES[mode]!!.boost
+              private fun sens(base: Int, i: Int) = (base + (if (i < 3) adj() else 0) + nudge).coerceIn(0, 100)
+              private fun dpiFor(m: Mode) = (nativeDpi * m.dpi / 10).roundToInt() * 10
+              private fun cmds(): String {
+                  val m = MODES[mode]!!
+                  return "adb shell pm grant com.fftuner android.permission.WRITE_SECURE_SETTINGS\n" + (if (m.dpi < 1.0) "adb shell wm density ${dpiFor(m)}" else "")
+              }
+
+              private fun secure() = checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == PackageManager.PERMISSION_GRANTED
+              private fun anim(v: String): Boolean {
+                  if (!secure()) return false
+                  return try {
+                      for (k in listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")) Settings.Global.putString(contentResolver, k, v)
+                      true
+                  } catch (e: Exception) { false }
+              }
+              private fun nm() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+              private fun dnd(on: Boolean): Boolean {
+                  if (!nm().isNotificationPolicyAccessGranted) return false
+                  nm().setInterruptionFilter(if (on) NotificationManager.INTERRUPTION_FILTER_PRIORITY else NotificationManager.INTERRUPTION_FILTER_ALL)
+                  return true
+              }
+              private fun applyAndLaunch() {
+                  val m = MODES[mode]!!
+                  if (m.dnd && !dnd(true)) {
+                      toast("Allow Do Not Disturb for FF Tuner, then tap again.")
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                      return
+                  }
+                  val a = anim(m.anim)
+                  val i = listOf("com.dts.freefiremax", "com.dts.freefireth").firstNotNullOfOrNull { packageManager.getLaunchIntentForPackage(it) }
+                  if (i == null) { toast("Free Fire is not installed."); return }
+                  toast(if (a) "Animations set to ${m.anim}x. Launching." else "Animation scales need the one-time ADB step. Launching.")
+                  startActivity(i)
+              }
+              private fun restore() {
+                  anim("1"); dnd(false)
+                  toast("Animations and sounds restored. If you changed DPI, run: adb shell wm density reset")
+                  refresh()
+              }
+              private fun freeRam() {
+                  val before = ram().availMem
+                  val pm = packageManager
+                  val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                  val home = pm.resolveActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0)?.activityInfo?.packageName
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  toast("Cleaning background apps...")
+                  Thread {
+                      for (r in apps) {
+                          val p = r.activityInfo.packageName
+                          if (p != packageName && p != home && !p.startsWith("com.dts.freefire")) am.killBackgroundProcesses(p)
+                      }
+                      Thread.sleep(1500)
+                      val after = ram().availMem
+                      runOnUiThread { toast("Free RAM: ${mb(before)} to ${mb(after)}"); refresh() }
+                  }.start()
+              }
+
+              private fun refresh() {
+                  val r = ram()
+                  val d = disk()
+                  val tp = "%.1f".format(temp())
+                  live.text = "Temp ${tp}C | Battery ${level()}%${if (plugged()) " charging" else ""} | Free RAM ${mb(r.availMem)} | Heat: ${heat()}"
+                  val items = listOf(
+                      "Free RAM above 1.5 GB" to (r.availMem > 1.5e9),
+                      "Phone below 38 C" to (temp() < 38f),
+                      "Battery above 30% or charging" to (level() > 30 || plugged()),
+                      "Free storage above 3 GB" to (d.availableBytes > 3e9),
+                      "Do Not Disturb is on" to (nm().currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL),
+                      "Animation scale 0.5x or lower" to (Settings.Global.getFloat(contentResolver, "window_animation_scale", 1f) <= 0.5f)
+                  )
+                  val score = items.count { it.second } * 100 / items.size
+                  chk.removeAllViews()
+                  chk.addView(tv("Match readiness: $score%", 18f, if (score >= 80) OK else if (score >= 50) ACC else BAD, true))
+                  for ((t, ok) in items) chk.addView(tv((if (ok) "OK   " else "FIX  ") + t, 13f, if (ok) OK else BAD, mono = true))
+              }
+
+              private fun render() {
+                  chips(rowS, STYLES.keys, style) { style = it; save(); render() }
+                  chips(rowM, MODES.keys, mode) { mode = it; save(); render() }
+                  val s = STYLES[style]!!
+                  val m = MODES[mode]!!
+                  nudgeTv.text = "Fine-tune: " + (if (nudge > 0) "+$nudge" else "$nudge")
+                  out.removeAllViews()
+                  out.addView(tv("$mode mode: ${m.about}", 14f, MUT))
+                  out.addView(tv("Sensitivity for $style", 18f, ACC, true))
+                  labels.forEachIndexed { i, l ->
+                      val x = sens(s.v[i], i)
+                      out.addView(tv("%-10s %s %3d".format(l, "#".repeat(x / 5) + ".".repeat(20 - x / 5), x), 13f, mono = true))
+                  }
+                  out.addView(tv("Controls and graphics", 18f, ACC, true))
+                  val gfx = if (tier() == "Low") "Smooth" else m.gfx
+                  val lines = listOf("Fire button: ${s.fire}% size, about 75% opacity", "Fingers: ${s.fingers}", "Graphics: $gfx", "Frame rate: ${m.fps}",
+                      "Shadows off. Sound effects high, music off to hear footsteps.", s.tip, m.tip)
+                  for (t in lines) out.addView(tv("- $t", 14f))
+                  out.addView(tv("Developer options", 18f, ACC, true))
+                  out.addView(tv("Animation scales: ${m.anim}x. DPI: " + (if (m.dpi < 1.0) "${dpiFor(m)}" else "keep $nativeDpi"), 14f))
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  prefs = getSharedPreferences("fft", MODE_PRIVATE)
+                  style = prefs.getString("style", style) ?: style
+                  mode = prefs.getString("mode", mode) ?: mode
+                  if (!STYLES.containsKey(style)) style = "Rusher"
+                  if (!MODES.containsKey(mode)) mode = "Professional"
+                  nudge = prefs.getInt("nudge", 0)
+                  nativeDpi = prefs.getInt("nat", resources.displayMetrics.densityDpi).also { prefs.edit().putInt("nat", it).apply() }
+                  rowS = LinearLayout(this)
+                  rowM = LinearLayout(this)
+                  out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  chk = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  live = tv("", 13f, MUT, mono = true)
+                  nudgeTv = tv("", 14f, MUT)
+                  val tune = LinearLayout(this)
+                  tune.addView(btn("Too fast -3") { nudge = (nudge - 3).coerceIn(-30, 30); save(); render() })
+                  tune.addView(btn("Too slow +3") { nudge = (nudge + 3).coerceIn(-30, 30); save(); render() })
+                  tune.addView(btn("Reset") { nudge = 0; save(); render() })
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(20), dp(16), dp(40)) }
+                  root.addView(tv("FF Tuner", 30f, TXT, true))
+                  root.addView(tv("Scan your phone, pick a style and mode, then enter the numbers in Free Fire.", 14f, MUT))
+                  root.addView(live)
+                  root.addView(tv("Your phone", 18f, ACC, true))
+                  root.addView(tv(info(), 13f, mono = true))
+                  root.addView(tv("Play style", 18f, ACC, true))
+                  root.addView(HorizontalScrollView(this).apply { addView(rowS) })
+                  root.addView(tv("Mode", 18f, ACC, true))
+                  root.addView(HorizontalScrollView(this).apply { addView(rowM) })
+                  root.addView(tv("After testing in Training Ground, nudge all values:", 14f, MUT))
+                  root.addView(tune)
+                  root.addView(nudgeTv)
+                  root.addView(out)
+                  root.addView(chk)
+                  root.addView(tv("Boost", 18f, ACC, true))
+                  root.addView(btn("Apply mode and launch Free Fire", true) { applyAndLaunch() })
+                  root.addView(btn("Free up RAM") { freeRam() })
+                  root.addView(btn("Restore normal settings") { restore() })
+                  root.addView(btn("Open Developer options") { startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) })
+                  root.addView(btn("Copy ADB setup commands") {
+                      (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("adb", cmds()))
+                      toast("Copied")
+                  })
+                  root.addView(tv("One-time setup: android apps cannot change animation scales or DPI alone. Run the copied commands from a PC, or from an on-phone ADB app such as LADB with wireless debugging. To undo DPI: adb shell wm density reset", 13f, MUT))
+                  setContentView(ScrollView(this).apply { setBackgroundColor(BG); addView(root) })
+                  render()
+                  refresh()
+              }
+
+              override fun onResume() { super.onResume(); hd.post(tick) }
+              override fun onPause() { super.onPause(); hd.removeCallbacks(tick) }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FF-Tuner-APK
+          path: build/outputs/apk/debug/*.apk
